@@ -1,0 +1,839 @@
+{
+  "name": "CECAPE - Envio unificado alunos + formadores (Diários QR)",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -224,
+        -48
+      ],
+      "id": "b739161e-299a-4b85-bb3e-356b3f819ce0",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 0 9 * * *"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -224,
+        144
+      ],
+      "id": "7e470381-83b0-480a-8a0c-010eac3b4ecf",
+      "name": "Agendamento 09:00"
+    },
+    {
+      "parameters": {
+        "content": "## CECAPE — Workflow unificado (alunos + formadores)\n\n**Como funciona:**\n1. Lê a agenda mensal (dados dos cursos/formadores). **Linhas em VERMELHO (fundo ou texto) na agenda são ignoradas** (nó \"HTTP - Ler Formatação Agenda (cores)\" + \"Code - Linhas Vermelhas Agenda\").\n2. Lista os diários \"AAAA MM DD CURSO DIÁRIO QR FORMAÇÃO\" na pasta do Drive.\n3. Para cada diário: percorre a linha 2 da aba FREQUÊNCIA (a partir de L2) até achar a data-alvo ou a sentinela 01/01/2026.\n4. Monta UMA fila ordenada: alunos do curso 1 → formadores do curso 1 → alunos do curso 2 → formadores do curso 2 → ...\n5. Um ÚNICO loop envia a fila na ordem (sem loops aninhados — bug conhecido do n8n com Split In Batches aninhado).\n\n**Variáveis** — edite o nó \"Config - Variáveis\":\n- `MODO_TESTE`: true = todos os e-mails vão para EMAIL_TESTE\n- `EMAIL_TESTE`: destinatário dos testes\n- `DIAS_A_FRENTE`: quantos dias após hoje consultar (1 = dia seguinte, 0 = hoje, 2 = depois de amanhã...). Regra do sábado→segunda continua valendo.",
+        "height": 460,
+        "width": 580,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -288,
+        -624
+      ],
+      "id": "2a20cf4e-11be-41c2-a434-1211960333d8",
+      "name": "Sticky Note - Instruções"
+    },
+    {
+      "parameters": {
+        "jsCode": "// =========================================================\n// CONFIGURAÇÕES GERAIS — EDITE AQUI PARA TESTES\n// =========================================================\n\n// MODO_TESTE = true  -> NENHUM e-mail vai para alunos/formadores;\n//                       todas as mensagens são redirecionadas para EMAIL_TESTE\n//                       (o assunto mostra quem seria o destinatário real).\n// MODO_TESTE = false -> envio real para os destinatários.\nconst MODO_TESTE = false;\n\n// E-mail que recebe as mensagens quando MODO_TESTE = true\nconst EMAIL_TESTE = 'prof.flavio.spina@gmail.com';\n\n// DIAS_A_FRENTE: quantos dias após a data ATUAL devem ser consultados.\n//   1 = dia seguinte (padrão de produção)\n//   2 = daqui a dois dias, e assim por diante\n//   0 = o próprio dia de hoje (útil para testes)\n// A regra de fim de semana continua valendo: se a data-alvo cair num sábado,\n// a segunda-feira seguinte também entra como data-alvo.\nconst DIAS_A_FRENTE = 1;\n\n// Pasta do Google Drive onde estão os diários (AAAA MM DD NOME DO CURSO DIÁRIO QR FORMAÇÃO)\nconst PASTA_DIARIOS_ID = '1-qF8Yh0oIXE8VJwypPjFkcjET1YCVmya';\n\n// Planilha da agenda mensal (dados dos cursos e dos formadores)\nconst AGENDA_SHEET_ID = '11_isrdRYiew08xo7rZyBqx1YkvyfR7IRmrHui37x768';\n\n// Data sentinela: ao encontrá-la na linha 2 da aba FREQUÊNCIA, para de percorrer a linha\nconst DATA_SENTINELA = '01/01/2026';\n\nreturn [{\n  json: {\n    MODO_TESTE,\n    EMAIL_TESTE,\n    DIAS_A_FRENTE,\n    PASTA_DIARIOS_ID,\n    AGENDA_SHEET_ID,\n    DATA_SENTINELA\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        48
+      ],
+      "id": "da7c68d5-a5ca-43b9-bd22-5f298e86a18f",
+      "name": "Config - Variáveis"
+    },
+    {
+      "parameters": {
+        "jsCode": "const cfg = $('Config - Variáveis').first().json;\nconst tz = 'America/Sao_Paulo';\n\nfunction pad(v) {\n  return String(v).padStart(2, '0');\n}\n\nconst dias = Number(cfg.DIAS_A_FRENTE);\nif (!Number.isFinite(dias) || dias < 0) {\n  throw new Error('DIAS_A_FRENTE inválido: use um número inteiro >= 0 (1 = dia seguinte).');\n}\n\nconst now = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));\nconst target = new Date(now);\ntarget.setDate(target.getDate() + Math.trunc(dias));\n\nfunction buildDateMeta(date, label) {\n  const yyyy = date.getFullYear();\n  const mm = pad(date.getMonth() + 1);\n  const dd = pad(date.getDate());\n  return {\n    label,\n    yyyy,\n    mm,\n    dd,\n    target_day: dd,\n    target_ymd: `${yyyy}-${mm}-${dd}`,\n    target_ddmmyyyy: `${dd}/${mm}/${yyyy}`,\n    weekday: date.toLocaleDateString('pt-BR', { timeZone: tz, weekday: 'long' })\n  };\n}\n\nconst targets = [buildDateMeta(target, 'data_alvo')];\n\n// Regra de fim de semana: se a data-alvo for sábado, inclui também a segunda-feira.\nif (target.getDay() === 6) {\n  const monday = new Date(target);\n  monday.setDate(monday.getDate() + 2);\n  targets.push(buildDateMeta(monday, 'segunda_antecipada'));\n}\n\nconst target_days = [...new Set(targets.map(t => t.target_day))];\nconst target_ymds = [...new Set(targets.map(t => t.target_ymd))];\nconst target_ddmmyyyys = [...new Set(targets.map(t => t.target_ddmmyyyy))];\nconst month_tabs = [...new Set(targets.map(t => {\n  const m = new Date(`${t.target_ymd}T12:00:00`);\n  const monthName = m.toLocaleDateString('pt-BR', { timeZone: tz, month: 'long' });\n  return monthName.charAt(0).toUpperCase() + monthName.slice(1);\n}))];\n\nreturn [{\n  json: {\n    modo_teste: cfg.MODO_TESTE,\n    dias_a_frente: Math.trunc(dias),\n    hoje: `${pad(now.getDate())}/${pad(now.getMonth() + 1)}/${now.getFullYear()}`,\n    target_day: target_days[0],\n    target_ymd: target_ymds[0],\n    target_ddmmyyyy: target_ddmmyyyys[0],\n    month_tab: month_tabs[0],\n    target_days,\n    target_ymds,\n    target_ddmmyyyys,\n    month_tabs,\n    targets,\n    includes_monday_advance: targets.some(t => t.label === 'segunda_antecipada')\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        48
+      ],
+      "id": "223cad67-fba5-4004-bbff-9cd1813eba48",
+      "name": "Preparar Data Alvo"
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://sheets.googleapis.com/v4/spreadsheets/' + $('Config - Variáveis').first().json.AGENDA_SHEET_ID + '?' + ($('Preparar Data Alvo').first().json.month_tabs || [$('Preparar Data Alvo').first().json.month_tab]).map(t => 'ranges=' + encodeURIComponent(\"'\" + String(t).toUpperCase() + \"'\")).join('&') + '&includeGridData=true&fields=' + encodeURIComponent('sheets(properties(title),data(startRow,rowData(values(formattedValue,effectiveFormat(backgroundColor,backgroundColorStyle,textFormat(foregroundColor,foregroundColorStyle))))))') }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        448,
+        48
+      ],
+      "id": "5f1c2b7e-9d3a-4e6b-8c21-7a0d4e9b3f10",
+      "name": "HTTP - Ler Formatação Agenda (cores)",
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "nIfyEUF469O4ic3a",
+          "name": "Google Sheets account 2"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// =========================================================\n// Identifica as LINHAS EM VERMELHO (fundo ou texto) em cada aba\n// da planilha da agenda, para que \"Code - Agenda Dia Seguinte\"\n// as ignore (cursos cancelados/remarcados marcados em vermelho).\n//\n// Entrada: resposta de spreadsheets.get com includeGridData=true\n// (uma entrada em \"sheets\" por aba do mês consultada).\n// Saída: UM item { _linhasVermelhas: { 'ABA': [nº da linha, ...] } }\n// Em caso de erro de leitura, devolve mapa vazio (nenhuma linha é\n// ignorada) para não interromper o envio dos e-mails.\n// =========================================================\n\nfunction num(v) {\n  return typeof v === 'number' && Number.isFinite(v) ? v : 0;\n}\n\n// Converte uma cor da API (campos zerados são OMITIDOS pelo Google) em {r,g,b,a}\nfunction rgb(color) {\n  if (!color || typeof color !== 'object') return null;\n  return {\n    r: num(color.red),\n    g: num(color.green),\n    b: num(color.blue),\n    a: color.alpha === undefined ? 1 : num(color.alpha)\n  };\n}\n\n// \"Vermelho\": canal R dominante, G e B baixos e parecidos entre si.\n// Cobre toda a paleta de vermelhos do Google Sheets (vermelho, vermelho\n// escuro 1/2/3, vermelho claro 1/2/3) e exclui laranja, rosa/magenta,\n// marrom, amarelo, cinza e branco.\nfunction isRed(c) {\n  if (!c || c.a === 0) return false;\n  const maxGB = Math.max(c.g, c.b);\n  return c.r >= 0.35 && (c.r - maxGB) >= 0.15 && Math.abs(c.g - c.b) <= 0.1;\n}\n\nfunction cellColors(cell) {\n  const f = (cell && cell.effectiveFormat) || {};\n  const bg = rgb(f.backgroundColor) || rgb(f.backgroundColorStyle && f.backgroundColorStyle.rgbColor);\n  const tf = f.textFormat || {};\n  const fg = rgb(tf.foregroundColor) || rgb(tf.foregroundColorStyle && tf.foregroundColorStyle.rgbColor);\n  return { bg: isRed(bg), fg: isRed(fg) };\n}\n\nfunction normHeader(s) {\n  return String(s || '')\n    .normalize('NFD')\n    .replace(/[̀-ͯ]/g, '')\n    .toUpperCase()\n    .trim();\n}\n\nconst resp = ($input.first() && $input.first().json) || {};\n\nlet erro = '';\nif (resp.error) {\n  erro = typeof resp.error === 'string' ? resp.error : (resp.error.message || 'Erro ao ler a formatação da agenda');\n}\n\nconst linhasVermelhas = {};\nconst detalhes = {};\n\nfor (const sheet of (Array.isArray(resp.sheets) ? resp.sheets : [])) {\n  const title = String(((sheet || {}).properties || {}).title || '').toUpperCase();\n  if (!title) continue;\n\n  const vermelhas = [];\n  const amostra = [];\n\n  for (const block of (Array.isArray(sheet.data) ? sheet.data : [])) {\n    const startRow = num(block.startRow);\n    const rowData = Array.isArray(block.rowData) ? block.rowData : [];\n\n    // Cabeçalho (linha 1): localiza a coluna TÍTULO\n    let colTitulo = -1;\n    if (startRow === 0 && rowData[0] && Array.isArray(rowData[0].values)) {\n      rowData[0].values.forEach((c, i) => {\n        if (normHeader(c && c.formattedValue) === 'TITULO') colTitulo = i;\n      });\n    }\n\n    rowData.forEach((r, i) => {\n      const rowNumber = startRow + i + 1; // nº da linha na planilha (1 = cabeçalho)\n      if (rowNumber === 1) return;\n\n      const cells = (r && Array.isArray(r.values)) ? r.values : [];\n      let preenchidas = 0;\n      let preenchidasVermelhas = 0;\n      let tituloVermelho = false;\n\n      cells.forEach((c, ci) => {\n        const temValor = !!(c && c.formattedValue !== undefined && String(c.formattedValue).trim() !== '');\n        if (!temValor) return;\n        const { bg, fg } = cellColors(c);\n        preenchidas++;\n        if (bg || fg) preenchidasVermelhas++;\n        if (ci === colTitulo && (bg || fg)) tituloVermelho = true;\n      });\n\n      if (!preenchidas) return;\n\n      // Linha vermelha = célula TÍTULO vermelha OU maioria das células preenchidas vermelhas\n      if (tituloVermelho || preenchidasVermelhas * 2 >= preenchidas) {\n        vermelhas.push(rowNumber);\n        if (amostra.length < 20) {\n          const t = colTitulo >= 0 && cells[colTitulo] ? cells[colTitulo].formattedValue : '';\n          amostra.push(`${rowNumber}: ${t || ''}`.trim());\n        }\n      }\n    });\n  }\n\n  linhasVermelhas[title] = vermelhas;\n  detalhes[title] = amostra;\n}\n\nreturn [{\n  json: {\n    _linhasVermelhas: linhasVermelhas,\n    _linhasVermelhasTotal: Object.values(linhasVermelhas).reduce((acc, v) => acc + v.length, 0),\n    _linhasVermelhasAmostra: detalhes,\n    _erroFormatacao: erro\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        48
+      ],
+      "id": "a3e8d4c1-6b2f-4f9a-9e57-2c1b8d0f6e42",
+      "name": "Code - Linhas Vermelhas Agenda"
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Config - Variáveis').first().json.AGENDA_SHEET_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "={{ (($('Preparar Data Alvo').first().json.month_tabs || [])[0] || $('Preparar Data Alvo').first().json.month_tab).toUpperCase() }}",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        896,
+        -48
+      ],
+      "id": "885419f6-639e-4dbb-8f8c-b5ee65661b6c",
+      "name": "Sheets - Agenda Mês 1",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "nIfyEUF469O4ic3a",
+          "name": "Google Sheets account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "={{ $('Config - Variáveis').first().json.AGENDA_SHEET_ID }}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "={{ (($('Preparar Data Alvo').first().json.month_tabs || [])[1] || ($('Preparar Data Alvo').first().json.month_tabs || [])[0] || $('Preparar Data Alvo').first().json.month_tab).toUpperCase() }}",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        896,
+        144
+      ],
+      "id": "94fdd586-ad8f-41b8-be5f-252c383647b0",
+      "name": "Sheets - Agenda Mês 2",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "nIfyEUF469O4ic3a",
+          "name": "Google Sheets account 2"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        1120,
+        48
+      ],
+      "id": "99ce32dc-ab4b-4ccd-ab44-c1d6caeb848f",
+      "name": "Merge - Agenda Meses"
+    },
+    {
+      "parameters": {
+        "jsCode": "const prep = $('Preparar Data Alvo').first().json;\n\nfunction pad(v) {\n  return String(v).padStart(2, '0');\n}\n\nfunction normalizeDateValue(raw) {\n  if (raw === null || raw === undefined || raw === '') return null;\n\n  if (typeof raw === 'number') {\n    const excelEpoch = new Date(Date.UTC(1899, 11, 30));\n    const date = new Date(excelEpoch.getTime() + raw * 86400000);\n    return {\n      ymd: `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`,\n      day: pad(date.getUTCDate())\n    };\n  }\n\n  const str = String(raw).trim();\n  if (!str) return null;\n\n  const br = str.match(/^(\\d{1,2})\\/(\\d{1,2})\\/(\\d{4})$/);\n  if (br) {\n    const [, d, m, y] = br;\n    return { ymd: `${y}-${pad(m)}-${pad(d)}`, day: pad(d) };\n  }\n\n  const iso = str.match(/^(\\d{4})-(\\d{2})-(\\d{2})/);\n  if (iso) {\n    const [, y, m, d] = iso;\n    return { ymd: `${y}-${m}-${d}`, day: d };\n  }\n\n  const onlyDay = str.match(/^\\d{1,2}$/);\n  if (onlyDay) {\n    return { ymd: null, day: pad(str) };\n  }\n\n  return null;\n}\n\nconst targetDays = new Set((prep.target_days || []).map(v => String(v).padStart(2, '0')));\nconst targetYmds = new Set(prep.target_ymds || []);\n\nconst seen = new Set();\nconst agenda = [];\n\n// ----- linhas em VERMELHO na planilha da agenda: ignorar -----\n// Mapa { 'ABA': [nº da linha, ...] } calculado em \"Code - Linhas Vermelhas Agenda\".\nlet linhasVermelhas = {};\ntry {\n  linhasVermelhas = $('Code - Linhas Vermelhas Agenda').first().json._linhasVermelhas || {};\n} catch (e) {\n  linhasVermelhas = {};\n}\nconst abas = (prep.month_tabs && prep.month_tabs.length ? prep.month_tabs : [prep.month_tab]).map(t => String(t).toUpperCase());\nconst abaMes1 = abas[0];\nconst abaMes2 = abas[1] || abas[0];\nconst vermelhasMes1 = new Set((linhasVermelhas[abaMes1] || []).map(Number));\nconst vermelhasMes2 = new Set((linhasVermelhas[abaMes2] || []).map(Number));\n\n// O Merge (append) entrega primeiro as linhas do Mês 1 e depois as do Mês 2.\nlet qtdMes1 = items.length;\ntry {\n  qtdMes1 = $('Sheets - Agenda Mês 1').all().length;\n} catch (e) {\n  qtdMes1 = items.length;\n}\n\nlet ignoradasVermelhas = 0;\n\nfor (let idx = 0; idx < items.length; idx++) {\n  const item = items[idx];\n  const row = item.json;\n\n  const doMes1 = idx < qtdMes1;\n  const numeroLinha = Number(row.row_number) || (doMes1 ? idx + 2 : idx - qtdMes1 + 2);\n  if ((doMes1 ? vermelhasMes1 : vermelhasMes2).has(numeroLinha)) {\n    ignoradasVermelhas++;\n    continue;\n  }\n\n  const parsed = normalizeDateValue(row['DATA'] ?? row['Data'] ?? row['data']);\n  if (!parsed) continue;\n\n  const match = (parsed.ymd && targetYmds.has(parsed.ymd)) || targetDays.has(parsed.day);\n  if (!match) continue;\n\n  const key = [row['DATA'] ?? '', row['TÍTULO'] ?? '', row['INÍCIO'] ?? row['INICIO'] ?? ''].join('|');\n  if (seen.has(key)) continue;\n  seen.add(key);\n\n  agenda.push({ ...row, _data_ymd: parsed.ymd || '', _data_dia: parsed.day });\n}\n\n// Empacota tudo em UM item para o fluxo continuar mesmo sem cursos na agenda.\nreturn [{ json: { _agenda: agenda, _agendaCount: agenda.length, _linhasVermelhasIgnoradas: ignoradasVermelhas } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        48
+      ],
+      "id": "71487170-baa1-4333-9de3-1cb0ac5c4ffa",
+      "name": "Code - Agenda Dia Seguinte"
+    },
+    {
+      "parameters": {
+        "resource": "fileFolder",
+        "returnAll": true,
+        "filter": {
+          "folderId": {
+            "__rl": true,
+            "value": "={{ $('Config - Variáveis').first().json.PASTA_DIARIOS_ID }}",
+            "mode": "id"
+          },
+          "whatToSearch": "all",
+          "fileTypes": [
+            "application/vnd.google-apps.spreadsheet"
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        1568,
+        48
+      ],
+      "id": "e1ca3681-a101-4560-b2e4-c787267ffd4b",
+      "name": "Drive - Listar Diários",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "wS6KN5d9PVC5ao2X",
+          "name": "Google Drive account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "function normalize(s = '') {\n  return String(s || '')\n    .normalize('NFD')\n    .replace(/[̀-ͯ]/g, '')\n    .toLowerCase()\n    .replace(/\\.(xlsx|xls|csv)$/i, '')\n    .replace(/[^\\p{L}\\p{N}]+/gu, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nconst seen = new Set();\nconst out = [];\n\nfor (const item of items) {\n  const id = String(item.json.id || '').trim();\n  const name = String(item.json.name || '').trim();\n  if (!id || !name || seen.has(id)) continue;\n  seen.add(id);\n\n  // Apenas arquivos \"... DIÁRIO QR FORMAÇÃO\"\n  const norm = normalize(name);\n  if (!norm.includes('diario qr formacao')) continue;\n\n  // Nome do curso = nome do arquivo sem o prefixo \"AAAA MM DD\" e sem o sufixo \"DIÁRIO QR FORMAÇÃO\"\n  const curso_nome = name\n    .replace(/^\\s*\\d{4}[\\s._-]+\\d{1,2}[\\s._-]+\\d{1,2}[\\s._-]*/, '')\n    .replace(/[-–—]?\\s*di[aá]rio\\s+qr\\s+forma[cç][aã]o.*$/i, '')\n    .replace(/\\.(xlsx|xls|csv)$/i, '')\n    .trim() || name;\n\n  out.push({\n    json: {\n      spreadsheetId: id,\n      spreadsheetName: name,\n      curso_nome,\n      course_key: normalize(curso_nome)\n    }\n  });\n}\n\nout.sort((a, b) => a.json.spreadsheetName.localeCompare(b.json.spreadsheetName, 'pt-BR'));\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1792,
+        48
+      ],
+      "id": "34c47d68-a243-4573-b2d4-db4ea7840e58",
+      "name": "Code - Preparar Diários"
+    },
+    {
+      "parameters": {
+        "url": "={{ \"https://sheets.googleapis.com/v4/spreadsheets/\" + $json.spreadsheetId + \"/values/\" + encodeURIComponent(\"FREQUÊNCIA!L2:2\") + \"?majorDimension=ROWS&valueRenderOption=FORMATTED_VALUE\" }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        2016,
+        48
+      ],
+      "id": "3da85026-0444-40ca-abaa-f3aba7c1525f",
+      "name": "HTTP - Ler Datas (FREQUÊNCIA L2)",
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "nIfyEUF469O4ic3a",
+          "name": "Google Sheets account 2"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const prep = $('Preparar Data Alvo').first().json;\nconst cfg = $('Config - Variáveis').first().json;\n\n// Os diários originais, na MESMA ordem em que entraram no nó HTTP\n// (o nó HTTP devolve exatamente um item de resposta por item de entrada).\nconst diarios = $('Code - Preparar Diários').all().map(i => i.json);\n\nfunction pad(v) {\n  return String(v).padStart(2, '0');\n}\n\nfunction toDate(raw) {\n  if (raw === null || raw === undefined || raw === '') return null;\n\n  if (typeof raw === 'number') {\n    const excelEpoch = new Date(Date.UTC(1899, 11, 30));\n    const d = new Date(excelEpoch.getTime() + raw * 86400000);\n    return {\n      ddmmyyyy: `${pad(d.getUTCDate())}/${pad(d.getUTCMonth() + 1)}/${d.getUTCFullYear()}`,\n      ddmm: `${pad(d.getUTCDate())}/${pad(d.getUTCMonth() + 1)}`\n    };\n  }\n\n  const str = String(raw).trim();\n  if (!str) return null;\n\n  let m = str.match(/(\\d{1,2})\\/(\\d{1,2})\\/(\\d{4})/);\n  if (m) return { ddmmyyyy: `${pad(m[1])}/${pad(m[2])}/${m[3]}`, ddmm: `${pad(m[1])}/${pad(m[2])}` };\n\n  m = str.match(/(\\d{4})-(\\d{2})-(\\d{2})/);\n  if (m) return { ddmmyyyy: `${m[3]}/${m[2]}/${m[1]}`, ddmm: `${m[3]}/${m[2]}` };\n\n  m = str.match(/^(\\d{1,2})\\/(\\d{1,2})$/);\n  if (m) return { ddmmyyyy: '', ddmm: `${pad(m[1])}/${pad(m[2])}` };\n\n  return null;\n}\n\nconst sentinela = toDate(cfg.DATA_SENTINELA) || { ddmmyyyy: '01/01/2026', ddmm: '01/01' };\nconst targetsFull = new Set(prep.target_ddmmyyyys || []);\nconst targetsDDMM = new Set((prep.target_ddmmyyyys || []).map(v => v.slice(0, 5)));\n\nconst out = [];\n\nitems.forEach((item, idx) => {\n  const resp = item.json || {};\n  const diario = diarios[idx] || {};\n\n  const row = Array.isArray(resp.values) && Array.isArray(resp.values[0]) ? resp.values[0] : [];\n\n  let erroLeitura = '';\n  if (resp.error) {\n    erroLeitura = typeof resp.error === 'string' ? resp.error : (resp.error.message || 'Erro ao ler a aba FREQUÊNCIA');\n  }\n\n  // Percorre a linha 2 a partir de L2; para na sentinela (01/01/2026).\n  let matched = '';\n  for (const cell of row) {\n    const d = toDate(cell);\n    if (!d) continue;\n\n    const isSentinela =\n      (d.ddmmyyyy && sentinela.ddmmyyyy && d.ddmmyyyy === sentinela.ddmmyyyy) ||\n      (!d.ddmmyyyy && d.ddmm === sentinela.ddmm);\n    if (isSentinela) break;\n\n    const isAlvo =\n      (d.ddmmyyyy && targetsFull.has(d.ddmmyyyy)) ||\n      (!d.ddmmyyyy && targetsDDMM.has(d.ddmm));\n    if (isAlvo) {\n      matched = d.ddmmyyyy || [...targetsFull].find(t => t.startsWith(d.ddmm)) || d.ddmm;\n      break;\n    }\n  }\n\n  if (matched) {\n    out.push({\n      json: {\n        spreadsheetId: diario.spreadsheetId,\n        spreadsheetName: diario.spreadsheetName,\n        curso_nome: diario.curso_nome,\n        course_key: diario.course_key,\n        TEM_CURSO: true,\n        DATA_MATCH: matched,\n        ERRO_LEITURA: erroLeitura\n      }\n    });\n  }\n});\n\nif (!out.length) {\n  return [{\n    json: {\n      TEM_CURSO: false,\n      _motivo: 'Nenhum diário com aula na(s) data(s)-alvo: ' + (prep.target_ddmmyyyys || []).join(', ')\n    }\n  }];\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        48
+      ],
+      "id": "c9c1b1cf-0e8d-4f75-8a15-43c3602ab30a",
+      "name": "Code - Verificar Datas"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "6d08b561-0cef-4e5c-b32c-4091ce064a04",
+              "leftValue": "={{ $json.TEM_CURSO }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2464,
+        48
+      ],
+      "id": "987bb5a2-63cc-4635-bb3f-e44242a6684a",
+      "name": "IF - Tem Cursos no Dia Alvo?"
+    },
+    {
+      "parameters": {
+        "url": "={{ \"https://sheets.googleapis.com/v4/spreadsheets/\" + $json.spreadsheetId + \"/values/\" + encodeURIComponent(\"FREQUÊNCIA!C3:D\") + \"?majorDimension=ROWS&valueRenderOption=FORMATTED_VALUE\" }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        2688,
+        320
+      ],
+      "id": "d97649af-27cc-422a-9d3f-e059816c8f6e",
+      "name": "HTTP - Ler Alunos (FREQUÊNCIA C3:D)",
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "nIfyEUF469O4ic3a",
+          "name": "Google Sheets account 2"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Monta UMA fila ordenada de envios:\n//   alunos do curso 1 -> formadores do curso 1 -> alunos do curso 2 -> ...\n// Assim o envio usa um ÚNICO loop, evitando o bug conhecido do n8n com\n// loops aninhados de Split In Batches (github.com/n8n-io/n8n/issues/23670).\n\nconst agenda = ($('Code - Agenda Dia Seguinte').first().json._agenda) || [];\n\n// Cursos com aula na data-alvo, na MESMA ordem em que entraram no nó HTTP.\nconst cursos = $('Code - Verificar Datas').all().map(i => i.json);\n\nfunction normalize(s = '') {\n  return String(s || '')\n    .normalize('NFD')\n    .replace(/[̀-ͯ]/g, '')\n    .toLowerCase()\n    .replace(/\\.(xlsx|xls|csv)$/i, '')\n    .replace(/[^\\p{L}\\p{N}]+/gu, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction scoreMatch(fileKey, agendaKey) {\n  if (!fileKey || !agendaKey) return 0;\n  if (fileKey === agendaKey) return 1000;\n  if (fileKey.includes(agendaKey) || agendaKey.includes(fileKey)) return 800;\n\n  const fileTokens = new Set(fileKey.split(' ').filter(Boolean));\n  const agendaTokens = new Set(agendaKey.split(' ').filter(Boolean));\n\n  let common = 0;\n  for (const t of fileTokens) {\n    if (agendaTokens.has(t)) common++;\n  }\n  if (!common) return 0;\n  return common * 10 - Math.abs(fileTokens.size - agendaTokens.size);\n}\n\nfunction formadoresDisplay(raw) {\n  return String(raw || '')\n    .replace(/\\r\\n?/g, '\\n')\n    .split('\\n')\n    .map(l => l\n      .replace(/^[-–•\\s]+/, '')\n      .replace(/\\s*[-–]\\s*[^\\s@]+@[^\\s@]+\\.[^\\s@]+\\s*$/i, '')\n      .replace(/<[^>]*>/g, '')\n      .trim())\n    .filter(Boolean)\n    .filter(l => !/^(formadores|professores)( externos)?:?$/i.test(l))\n    .join(', ');\n}\n\nfunction normalizeRawText(text = '') {\n  return String(text || '')\n    .replace(/\\\\r\\\\n/g, '\\n')\n    .replace(/\\\\n/g, '\\n')\n    .replace(/\\\\r/g, '\\n')\n    .replace(/\\r\\n/g, '\\n')\n    .replace(/\\r/g, '\\n')\n    .trim();\n}\n\nfunction splitLines(text = '') {\n  return normalizeRawText(text)\n    .split('\\n')\n    .map(v => v.trim())\n    .filter(Boolean);\n}\n\nfunction cleanLine(value = '') {\n  return String(value || '')\n    .replace(/^[-–•\\s]+/, '')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction isHeaderLine(s) {\n  const t = String(s || '').trim().toUpperCase();\n  return [\n    'FORMADORES:',\n    'FORMADORES',\n    'FORMADORES EXTERNOS:',\n    'FORMADORES EXTERNOS',\n    'PROFESSORES:',\n    'PROFESSORES',\n    'PROFESSORES EXTERNOS:',\n    'PROFESSORES EXTERNOS'\n  ].includes(t);\n}\n\nfunction parsePerson(rawLine) {\n  const value = cleanLine(rawLine);\n  if (!value || isHeaderLine(value)) return null;\n\n  let m = value.match(/^(.*?)\\s*-\\s*([A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,})$/i);\n  if (m) {\n    return { nome: cleanLine(m[1]), email: m[2].trim().toLowerCase() };\n  }\n\n  m = value.match(/^(.*?)<\\s*([^>]+@[^>]+)\\s*>$/);\n  if (m) {\n    return { nome: cleanLine(m[1]) || m[2].trim(), email: m[2].trim().toLowerCase() };\n  }\n\n  m = value.match(/^([A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,})$/i);\n  if (m) {\n    return { nome: m[1].trim(), email: m[1].trim().toLowerCase() };\n  }\n\n  return null;\n}\n\n// ----- frases dinâmicas conforme a distância entre hoje e a data do curso -----\nconst hojeStr = $('Preparar Data Alvo').first().json.hoje; // DD/MM/AAAA\n\nfunction parseBR(s) {\n  const m = String(s || '').match(/^(\\d{1,2})\\/(\\d{1,2})\\/(\\d{4})$/);\n  return m ? new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]), 12, 0, 0) : null;\n}\n\nfunction capitalize(s) {\n  return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;\n}\n\nfunction frasesDoDia(dataBR) {\n  if (!dataBR) {\n    return { DIA_SEMANA: '', FRASE_ABERTURA: 'Em breve', REF_DIA: 'do curso' };\n  }\n  const alvo = parseBR(dataBR);\n  const hoje = parseBR(hojeStr);\n  const weekday = alvo ? capitalize(alvo.toLocaleDateString('pt-BR', { weekday: 'long' })) : '';\n  const diff = (alvo && hoje) ? Math.round((alvo - hoje) / 86400000) : null;\n  const masculino = /sábado|domingo/i.test(weekday);\n\n  // FRASE_ABERTURA completa a frase: \"... teremos um compromisso importante no CECAPE!\"\n  // REF_DIA completa a frase: \"... a mensagem sobre o compromisso ...\"\n  if (diff === 0) {\n    return { DIA_SEMANA: weekday, FRASE_ABERTURA: `Hoje, ${weekday},`, REF_DIA: `de hoje (${weekday})` };\n  }\n  if (diff === 1) {\n    return { DIA_SEMANA: weekday, FRASE_ABERTURA: `Amanhã, ${weekday},`, REF_DIA: `de amanhã (${weekday})` };\n  }\n  if (diff !== null && diff > 1) {\n    return {\n      DIA_SEMANA: weekday,\n      FRASE_ABERTURA: masculino\n        ? `No próximo ${weekday}, dia ${dataBR},`\n        : `Na próxima ${weekday}, dia ${dataBR},`,\n      REF_DIA: masculino\n        ? `do próximo ${weekday} (${dataBR})`\n        : `da próxima ${weekday} (${dataBR})`\n    };\n  }\n  return { DIA_SEMANA: weekday, FRASE_ABERTURA: `No dia ${dataBR},`, REF_DIA: `do dia ${dataBR}` };\n}\n\nconst emailRegex = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]{2,}$/;\nconst fila = [];\n\nitems.forEach((item, idx) => {\n  const resp = item.json || {};\n  const info = cursos[idx] || {};\n  const dm = String(info.DATA_MATCH || '');\n\n  // ----- localizar o curso na agenda mensal (sala, horário, formadores) -----\n  let curso = null;\n  let bestScore = 0;\n\n  for (const a of agenda) {\n    const aKey = normalize(a['TÍTULO'] || a['TITULO'] || '');\n    let score = scoreMatch(info.course_key, aKey);\n    if (dm && a._data_ymd && dm === a._data_ymd.split('-').reverse().join('/')) score += 50;\n    else if (dm && a._data_dia && dm.slice(0, 2) === a._data_dia) score += 20;\n    if (score > bestScore) {\n      bestScore = score;\n      curso = a;\n    }\n  }\n\n  const encontrado = !!curso && bestScore >= 10;\n  const formadoresRaw = encontrado ? String(curso['FORMADORES'] ?? curso['PROFESSORES'] ?? '') : '';\n\n  const cursoInfo = {\n    spreadsheetId: info.spreadsheetId,\n    spreadsheetName: info.spreadsheetName,\n    curso_nome: info.curso_nome,\n    course_key: info.course_key,\n    DATA: dm || (encontrado ? String(curso['DATA'] ?? '') : ''),\n    'TÍTULO': encontrado && curso['TÍTULO'] ? curso['TÍTULO'] : info.curso_nome,\n    'ESPAÇO': encontrado ? (curso['ESPAÇO'] ?? curso['ESPACO'] ?? '') : '',\n    INICIO: encontrado ? (curso['INÍCIO'] ?? curso['INICIO'] ?? '') : '',\n    TERMINO: encontrado ? (curso['TÉRMINO'] ?? curso['TERMINO'] ?? '') : '',\n    ETAPAS: encontrado ? (curso['ETAPAS'] ?? '') : '',\n    FORMATO: encontrado ? (curso['FORMATO'] ?? '') : '',\n    'GOOGLE SALA DE AULA': encontrado ? (curso['GOOGLE SALA DE AULA'] ?? '') : '',\n    FORMADORES: formadoresDisplay(formadoresRaw),\n    CURSO_ENCONTRADO_NA_AGENDA: encontrado,\n    SCORE_AGENDA: bestScore\n  };\n\n  Object.assign(cursoInfo, frasesDoDia(cursoInfo.DATA));\n\n  // ----- alunos: coluna C = nome, coluna D = e-mail (a partir da linha 3) -----\n  const rows = Array.isArray(resp.values) ? resp.values : [];\n  const seenAlunos = new Set();\n\n  for (const r of rows) {\n    const nome = String((r && r[0]) || '').trim();\n    const email = String((r && r[1]) || '').trim().toLowerCase();\n    if (!email || !emailRegex.test(email)) continue;\n    if (seenAlunos.has(email)) continue;\n    seenAlunos.add(email);\n\n    fila.push({\n      json: {\n        ...cursoInfo,\n        TIPO_ENVIO: 'ALUNO',\n        NOME: nome || email,\n        EMAIL_ALUNO: email\n      }\n    });\n  }\n\n  // ----- formadores do MESMO curso, logo após os alunos -----\n  const seenProf = new Set();\n\n  for (const linha of splitLines(formadoresRaw)) {\n    const p = parsePerson(linha);\n    if (!p || !p.email) continue;\n    if (seenProf.has(p.email)) continue;\n    seenProf.add(p.email);\n\n    fila.push({\n      json: {\n        ...cursoInfo,\n        TIPO_ENVIO: 'FORMADOR',\n        PROFESSOR_NOME: p.nome,\n        PROFESSOR_EMAIL: p.email,\n        HORARIO_INICIO: cursoInfo.INICIO || '',\n        HORARIO_FIM: cursoInfo.TERMINO || '',\n        TITULO_CURSO: cursoInfo['TÍTULO'] || info.curso_nome\n      }\n    });\n  }\n});\n\nif (!fila.length) {\n  return [{\n    json: {\n      TIPO_ENVIO: 'NENHUM',\n      _motivo: 'Cursos com aula na data-alvo foram encontrados, mas sem alunos/formadores com e-mail válido.'\n    }\n  }];\n}\n\nreturn fila.map((f, i) => ({ json: { ...f.json, ORDEM: i + 1, TOTAL_FILA: fila.length } }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2912,
+        320
+      ],
+      "id": "abb2129e-3a0b-4700-a7bf-f35fea898e36",
+      "name": "Code - Montar Fila de Envios"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        3136,
+        320
+      ],
+      "id": "32c672f7-3d6d-4d29-b759-a530d5d8482b",
+      "name": "Loop Envios"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "5c7ec4f6-6948-4002-a8c8-c9a8df641965",
+              "leftValue": "={{ $json.TIPO_ENVIO }}",
+              "rightValue": "ALUNO",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3664,
+        -80
+      ],
+      "id": "dd8246e0-d505-4ddd-8c64-0c33dcb39039",
+      "name": "IF - Envio para Aluno?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "de70a555-9a0a-45ad-ae4d-e5a95de80764",
+              "leftValue": "={{ $json.TIPO_ENVIO }}",
+              "rightValue": "FORMADOR",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3872,
+        128
+      ],
+      "id": "1685807e-2a4b-4a6f-bbfe-ebd729ae356f",
+      "name": "IF - Envio para Formador?"
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Config - Variáveis').first().json.MODO_TESTE ? $('Config - Variáveis').first().json.EMAIL_TESTE : $json.EMAIL_ALUNO }}",
+        "subject": "={{ ($('Config - Variáveis').first().json.MODO_TESTE ? '[TESTE p/ ' + $json.EMAIL_ALUNO + '] ' : '') + 'Aviso CECAPE • ' + $json['TÍTULO'] + ' • Dia ' + $json.DATA }}",
+        "message": "=<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n <style>\n    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: #333; line-height: 1.6; background-color: #28b1d4; margin: 0; padding: 20px; }\n    .container { width: 100%; max-width: 600px; margin: 0 auto; border: 1px solid #e0e0e0; border-radius: 12px; overflow: hidden; background-color: #ffffff; }\n\n    .header { background-color: #ffffff; padding: 25px; text-align: center; border-bottom: 4px solid #00accf; }\n    .header-table { width: 100%; border-collapse: collapse; table-layout: fixed; }\n    .header-table td { width: 50%; text-align: center; vertical-align: middle; padding: 10px; }\n\n    .header-table img { width: 100%; max-width: 180px; height: auto; display: inline-block; }\n\n    .content { padding: 35px; background-color: #ffffff; }\n    .card { background: #f8f9fa; padding: 25px; border-radius: 8px; border-left: 5px solid #00accf; margin: 20px 0; }\n\n    .info-row { margin-bottom: 12px; font-size: 15px; border-bottom: 1px solid #eee; padding-bottom: 5px; }\n    .info-label { font-weight: bold; color: #00accf; text-transform: uppercase; font-size: 12px; display: block; }\n    .info-value { color: #333; font-size: 16px; }\n\n    h2 { color: #00accf; margin-top: 0; font-size: 22px; text-align: center; }\n\n    .footer { background-color: #00accf; color: #ffffff; text-align: center; padding: 20px; font-size: 13px; font-weight: 300; }\n\n    .no-reply {\n      margin-top: 20px;\n      padding: 15px;\n      background-color: #fff3cd;\n      border: 1px solid #ffeeba;\n      border-radius: 8px;\n      color: #856404;\n      font-size: 13px;\n      text-align: center;\n    }\n\n  </style>\n</head>\n<body>\n  <div class=\"container\">\n    <div class=\"header\">\n      <table class=\"header-table\">\n        <tr>\n          <td><img src=\"https://cecapescs.com.br/logos/logo-seeduc.png\" alt=\"SEEDUC\"></td>\n          <td><img src=\"https://cecapescs.com.br/logos/logo-cecape.png\" alt=\"CECAPE\"></td>\n        </tr>\n      </table>\n    </div>\n\n    <div class=\"content\">\n      <h2>Olá, <strong>{{ $json[\"NOME\"] }}</strong>!</h2>\n      <p>\n        {{ $json.FRASE_ABERTURA }} teremos um compromisso importante no CECAPE!\n        <br>\n        Seguem os dados de identificação do seu curso:\n      </p>\n\n      <div class=\"card\">\n        <p><span class=\"info-label\">Data:</span> {{ $json[\"DATA\"] }}</p>\n        <p><span class=\"info-label\">Sala/Local:</span> {{ $json['ESPAÇO'] }}</p>\n        <p><span class=\"info-label\">Horário:</span> {{ $json[\"INICIO\"] }} - {{ $json[\"TERMINO\"] }}</p>\n        <p><span class=\"info-label\">Curso:</span> {{ $json['TÍTULO'] }} </p>\n        <p><span class=\"info-label\">Formador(es):</span> {{ $json[\"FORMADORES\"] }}</p>\n        <p><span class=\"info-label\">Etapas:</span> {{ $json[\"ETAPAS\"] }}</p>\n        <p><span class=\"info-label\">Formato:</span> {{ $json[\"FORMATO\"] }}</p>\n        <p><span class=\"info-label\">Google Sala de Aula:</span> {{ $json[\"GOOGLE SALA DE AULA\"] }}</p>\n      </div>\n\n      <p style=\"margin-top: 20px;\">\n        Caso algum dado esteja incorreto, por favor, entre em contato com a secretaria.\n      </p>\n\n      <!-- Aviso de mensagem automática -->\n      <div class=\"no-reply\">\n        ⚠️ Esta é uma mensagem automática enviada pelo sistema do CECAPE.<br>\n        Por favor, não responda este e-mail, pois esta caixa de entrada não é monitorada.\n      </div>\n\n    </div>\n\n    <div class=\"footer\">\n      CECAPE - Centro de Capacitação de Profissionais da Educação<br>\n      Secretaria Municipal de Educação de São Caetano do Sul\n    </div>\n  </div>\n</body>\n</html>",
+        "options": {
+          "appendAttribution": false,
+          "senderName": "CECAPE - SEEDUC"
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        3888,
+        -144
+      ],
+      "id": "61405c51-5f4a-4805-ace4-5d0e500aeff5",
+      "name": "Gmail - Enviar Aluno",
+      "webhookId": "31383c59-e27b-40f8-ae05-1dd2e4f0096d",
+      "alwaysOutputData": true,
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "XWgFO39uPRofIXId",
+          "name": "Gmail account 2"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "amount": 10,
+        "unit": "seconds"
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [
+        4112,
+        -80
+      ],
+      "id": "e41826a5-90b5-451e-bc91-9f8bdb1f6031",
+      "name": "Wait Aluno (20s)",
+      "webhookId": "1ef2e8dc-8585-429f-b0e6-70942629fd4c"
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Config - Variáveis').first().json.MODO_TESTE ? $('Config - Variáveis').first().json.EMAIL_TESTE : $json.PROFESSOR_EMAIL }}",
+        "subject": "={{ ($('Config - Variáveis').first().json.MODO_TESTE ? '[TESTE p/ ' + $json.PROFESSOR_EMAIL + '] ' : '') + 'Aviso CECAPE • ' + $json['TÍTULO'] + ' • Dia ' + $json.DATA }}",
+        "message": "=<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n <style>\n    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: #333; line-height: 1.6; background-color: #28b1d4; margin: 0; padding: 20px; }\n    .container { width: 100%; max-width: 600px; margin: 0 auto; border: 1px solid #e0e0e0; border-radius: 12px; overflow: hidden; background-color: #ffffff; }\n\n    .header { background-color: #ffffff; padding: 25px; text-align: center; border-bottom: 4px solid #00accf; }\n    .header-table { width: 100%; border-collapse: collapse; table-layout: fixed; }\n    .header-table td { width: 50%; text-align: center; vertical-align: middle; padding: 10px; }\n\n    .header-table img { width: 100%; max-width: 180px; height: auto; display: inline-block; }\n\n    .content { padding: 35px; background-color: #ffffff; }\n    .card { background: #f8f9fa; padding: 25px; border-radius: 8px; border-left: 5px solid #00accf; margin: 20px 0; }\n\n    .info-row { margin-bottom: 12px; font-size: 15px; border-bottom: 1px solid #eee; padding-bottom: 5px; }\n    .info-label { font-weight: bold; color: #00accf; text-transform: uppercase; font-size: 12px; display: block; }\n    .info-value { color: #333; font-size: 16px; }\n\n    h2 { color: #00accf; margin-top: 0; font-size: 22px; text-align: center; }\n\n    .footer { background-color: #00accf; color: #ffffff; text-align: center; padding: 20px; font-size: 13px; font-weight: 300; }\n\n    .no-reply {\n      margin-top: 20px;\n      padding: 15px;\n      background-color: #fff3cd;\n      border: 1px solid #ffeeba;\n      border-radius: 8px;\n      color: #856404;\n      font-size: 13px;\n      text-align: center;\n    }\n\n  </style>\n</head>\n<body>\n  <div class=\"container\">\n    <div class=\"header\">\n      <table class=\"header-table\">\n        <tr>\n          <td><img src=\"https://cecapescs.com.br/logos/logo-seeduc.png\" alt=\"SEEDUC\"></td>\n          <td><img src=\"https://cecapescs.com.br/logos/logo-cecape.png\" alt=\"CECAPE\"></td>\n        </tr>\n      </table>\n    </div>\n\n    <div class=\"content\">\n      <h2>Olá, <strong>{{ $json.PROFESSOR_NOME }}</strong>!</h2>\n      <p>\n        Seus alunos já receberam a mensagem sobre o compromisso {{ $json.REF_DIA }}.\n\n        <br>\n        Seguem os dados de identificação do seu curso:\n      </p>\n\n      <div class=\"card\">\n        <p><span class=\"info-label\">Data:</span> {{ $json[\"DATA\"] }}</p>\n        <p><span class=\"info-label\">Sala/Local:</span> {{ $json[\"ESPAÇO\"] }}</p>\n        <p><span class=\"info-label\">Horário:</span> {{ $json.HORARIO_INICIO }} - {{ $json.HORARIO_FIM }}</p>\n        <p><span class=\"info-label\">Curso:</span> {{ $json[\"TÍTULO\"] }}</p>\n\n        <p><span class=\"info-label\">Etapas:</span> {{ $json[\"ETAPAS\"] }}</p>\n        <p><span class=\"info-label\">Formato:</span> {{ $json[\"FORMATO\"] }}</p>\n        <p><span class=\"info-label\">Google Sala de Aula:</span> {{ $json[\"GOOGLE SALA DE AULA\"] }}</p>\n      </div>\n\n      <p style=\"margin-top: 20px;\">\n        Caso algum dado esteja incorreto, por favor, entre em contato com a secretaria.\n      </p>\n\n      <!-- Aviso de mensagem automática -->\n      <div class=\"no-reply\">\n        ⚠️ Esta é uma mensagem automática enviada pelo sistema do CECAPE.<br>\n        Por favor, não responda este e-mail, pois esta caixa de entrada não é monitorada.\n      </div>\n\n    </div>\n\n    <div class=\"footer\">\n      CECAPE - Centro de Capacitação de Profissionais da Educação<br>\n      Secretaria Municipal de Educação de São Caetano do Sul\n    </div>\n  </div>\n</body>\n</html>",
+        "options": {
+          "appendAttribution": false,
+          "senderName": "CECAPE - SEEDUC"
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        4176,
+        128
+      ],
+      "id": "6b8001ed-61fb-43c3-a0de-f25ae76abffc",
+      "name": "Gmail - Enviar Formador",
+      "webhookId": "d069ebad-cf30-4d33-ab5a-399cda9dc412",
+      "alwaysOutputData": true,
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "XWgFO39uPRofIXId",
+          "name": "Gmail account 2"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "amount": 5,
+        "unit": "seconds"
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [
+        4480,
+        368
+      ],
+      "id": "157dfa11-873b-432f-8aa9-d8f900f1c3de",
+      "name": "Wait Formador (5s)",
+      "webhookId": "ee3ddd41-e6e8-4235-a833-17a79fd4e164"
+    },
+    {
+      "parameters": {
+        "jsCode": "let fila = [];\ntry {\n  fila = $('Code - Montar Fila de Envios').all().map(i => i.json);\n} catch (e) {\n  fila = [];\n}\n\nconst envios = fila.filter(f => f.TIPO_ENVIO === 'ALUNO' || f.TIPO_ENVIO === 'FORMADOR');\nconst cursos = [...new Set(envios.map(f => f.spreadsheetName))];\n\nreturn [{\n  json: {\n    status: envios.length ? 'CONCLUIDO' : 'SEM_ENVIOS',\n    cursos_processados: cursos.length,\n    cursos,\n    emails_alunos: envios.filter(f => f.TIPO_ENVIO === 'ALUNO').length,\n    emails_formadores: envios.filter(f => f.TIPO_ENVIO === 'FORMADOR').length,\n    mensagem: envios.length\n      ? 'Fila processada na ordem: alunos e depois formadores, turma a turma.'\n      : 'Nenhum e-mail para enviar na(s) data(s)-alvo.'\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        -96
+      ],
+      "id": "97ddbeac-b9ea-4c32-b200-990ffa6d26e7",
+      "name": "Code - Resumo Final"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Config - Variáveis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agendamento 09:00": {
+      "main": [
+        [
+          {
+            "node": "Config - Variáveis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config - Variáveis": {
+      "main": [
+        [
+          {
+            "node": "Preparar Data Alvo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Data Alvo": {
+      "main": [
+        [
+          {
+            "node": "HTTP - Ler Formatação Agenda (cores)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sheets - Agenda Mês 1": {
+      "main": [
+        [
+          {
+            "node": "Merge - Agenda Meses",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sheets - Agenda Mês 2": {
+      "main": [
+        [
+          {
+            "node": "Merge - Agenda Meses",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge - Agenda Meses": {
+      "main": [
+        [
+          {
+            "node": "Code - Agenda Dia Seguinte",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Agenda Dia Seguinte": {
+      "main": [
+        [
+          {
+            "node": "Drive - Listar Diários",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drive - Listar Diários": {
+      "main": [
+        [
+          {
+            "node": "Code - Preparar Diários",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Preparar Diários": {
+      "main": [
+        [
+          {
+            "node": "HTTP - Ler Datas (FREQUÊNCIA L2)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP - Ler Datas (FREQUÊNCIA L2)": {
+      "main": [
+        [
+          {
+            "node": "Code - Verificar Datas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Verificar Datas": {
+      "main": [
+        [
+          {
+            "node": "IF - Tem Cursos no Dia Alvo?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Tem Cursos no Dia Alvo?": {
+      "main": [
+        [
+          {
+            "node": "HTTP - Ler Alunos (FREQUÊNCIA C3:D)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code - Resumo Final",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP - Ler Alunos (FREQUÊNCIA C3:D)": {
+      "main": [
+        [
+          {
+            "node": "Code - Montar Fila de Envios",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Montar Fila de Envios": {
+      "main": [
+        [
+          {
+            "node": "Loop Envios",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Envios": {
+      "main": [
+        [
+          {
+            "node": "Code - Resumo Final",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IF - Envio para Aluno?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Envio para Aluno?": {
+      "main": [
+        [
+          {
+            "node": "Gmail - Enviar Aluno",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IF - Envio para Formador?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - Envio para Formador?": {
+      "main": [
+        [
+          {
+            "node": "Gmail - Enviar Formador",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Envios",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail - Enviar Aluno": {
+      "main": [
+        [
+          {
+            "node": "Wait Aluno (20s)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Aluno (20s)": {
+      "main": [
+        [
+          {
+            "node": "Loop Envios",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail - Enviar Formador": {
+      "main": [
+        [
+          {
+            "node": "Wait Formador (5s)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Formador (5s)": {
+      "main": [
+        [
+          {
+            "node": "Loop Envios",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP - Ler Formatação Agenda (cores)": {
+      "main": [
+        [
+          {
+            "node": "Code - Linhas Vermelhas Agenda",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Linhas Vermelhas Agenda": {
+      "main": [
+        [
+          {
+            "node": "Sheets - Agenda Mês 1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Sheets - Agenda Mês 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "e32cdece-3668-4a55-b9d3-c9dbd0b2cb6f",
+  "meta": {
+    "instanceId": "9064fe32635d2fcaca845aac95e526c58baa32ac68be71412291cb0f1d193974"
+  },
+  "id": "grDIWDv1pAydd3Zb",
+  "tags": []
+}
